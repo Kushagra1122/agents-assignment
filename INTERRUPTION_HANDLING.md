@@ -1,5 +1,7 @@
 # Intelligent Interruption Handling for LiveKit Agents
 
+**Demo video:** [Interruption handling in action](https://youtu.be/-_j_CaOWiz8)
+
 ## Problem
 
 When an AI agent is speaking, LiveKit's default VAD is too sensitive to user feedback. If the user says "yeah," "ok," or "hmm" to indicate they're listening, the agent interprets this as an interruption and stops speaking abruptly.
