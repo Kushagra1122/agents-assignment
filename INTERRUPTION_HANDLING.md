@@ -1,6 +1,6 @@
 # Intelligent Interruption Handling for LiveKit Agents
 
-**Demo video:** [Interruption handling in action](https://youtu.be/-_j_CaOWiz8)
+**Demo video:** [Interruption handling in action](https://youtu.be/ynl37J1Hq4M)
 
 ## Problem
 
