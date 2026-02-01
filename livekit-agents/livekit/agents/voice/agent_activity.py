@@ -61,6 +61,7 @@ from .events import (
     SpeechCreatedEvent,
     UserInputTranscribedEvent,
 )
+from .interruption_filter import InterruptionClassifier, InterruptionDecision
 from .generation import (
     ToolExecutionOutput,
     _AudioOutput,
@@ -163,6 +164,22 @@ class AgentActivity(RecognitionHooks):
 
         # speeches that audio playout finished but not done because of tool calls
         self._background_speeches: set[SpeechHandle] = set()
+
+        # Initialize interruption classifier for smart filtering
+        ignore_words = getattr(self._session.options, 'ignore_words', None)
+        interrupt_words = getattr(self._session.options, 'interrupt_words', None)
+        grace_period = getattr(self._session.options, 'interruption_grace_period', 0.3)
+        
+        self._interruption_classifier: InterruptionClassifier | None = None
+        if ignore_words is not None or interrupt_words is not None:
+            self._interruption_classifier = InterruptionClassifier(
+                ignore_words=ignore_words or [],
+                interrupt_words=interrupt_words or [],
+                grace_period=grace_period,
+            )
+        
+        # Flag to suppress current utterance if classified as backchannel
+        self._suppress_current_utterance: bool = False
 
     def _validate_turn_detection(
         self, turn_detection: TurnDetectionMode | None
@@ -1240,8 +1257,89 @@ class AgentActivity(RecognitionHooks):
             # ignore vad inference done event if turn_detection is manual or realtime_llm
             return
 
+        # Use interruption classifier if available
+        if self._interruption_classifier is not None:
+            # Get current transcript from audio recognition
+            transcript = ""
+            if self._audio_recognition is not None:
+                transcript = getattr(self._audio_recognition, '_current_transcript', '')
+            
+            # Check if agent is currently speaking
+            agent_speaking = (
+                self._current_speech is not None
+                and not self._current_speech.interrupted
+                and self._current_speech.allow_interruptions
+            )
+            
+            # Classify the potential interruption
+            decision = self._interruption_classifier.classify(transcript, agent_speaking)
+            
+            logger.info(
+                f"[INTERRUPT_FILTER] VAD triggered | transcript='{transcript}' | "
+                f"agent_speaking={agent_speaking} | decision={decision.value}"
+            )
+            
+            if decision == InterruptionDecision.IGNORE:
+                logger.info(
+                    f"[INTERRUPT_FILTER] ✓ IGNORING - agent continues | transcript='{transcript}'"
+                )
+                self._suppress_current_utterance = True
+                return
+            elif decision == InterruptionDecision.INTERRUPT:
+                logger.info(
+                    f"[INTERRUPT_FILTER] ✗ INTERRUPTING - agent stops | transcript='{transcript}'"
+                )
+                self._suppress_current_utterance = False
+                # Fall through to normal interrupt handling
+            elif decision == InterruptionDecision.PENDING:
+                # Start grace period - use asyncio to handle timing
+                logger.info(
+                    f"[INTERRUPT_FILTER] ⏳ PENDING - waiting {self._interruption_classifier._grace_period}s for more STT data | transcript='{transcript}'"
+                )
+                asyncio.create_task(
+                    self._handle_interruption_grace_period(transcript, ev)
+                )
+                return
+
         if ev.speech_duration >= self._session.options.min_interruption_duration:
             self._interrupt_by_audio_activity()
+
+    async def _handle_interruption_grace_period(
+        self, initial_transcript: str, ev: vad.VADEvent
+    ) -> None:
+        """Handle the grace period for interruption classification."""
+        if self._interruption_classifier is None:
+            return
+            
+        await asyncio.sleep(self._interruption_classifier._grace_period)
+        
+        # Get updated transcript after grace period
+        transcript = initial_transcript
+        if self._audio_recognition is not None:
+            transcript = getattr(self._audio_recognition, '_current_transcript', initial_transcript)
+        
+        # Make final decision
+        final_decision = self._interruption_classifier.classify_final(
+            InterruptionDecision.PENDING, transcript
+        )
+        
+        logger.info(
+            f"[INTERRUPT_FILTER] Grace period ended | transcript='{transcript}' | "
+            f"final_decision={final_decision}"
+        )
+        
+        if final_decision == "ignore":
+            logger.info(
+                f"[INTERRUPT_FILTER] ✓ IGNORING after grace period - agent continues | transcript='{transcript}'"
+            )
+            self._suppress_current_utterance = True
+        else:
+            logger.info(
+                f"[INTERRUPT_FILTER] ✗ INTERRUPTING after grace period | transcript='{transcript}'"
+            )
+            self._suppress_current_utterance = False
+            if ev.speech_duration >= self._session.options.min_interruption_duration:
+                self._interrupt_by_audio_activity()
 
     def on_interim_transcript(self, ev: stt.SpeechEvent, *, speaking: bool | None) -> None:
         if isinstance(self.llm, llm.RealtimeModel) and self.llm.capabilities.user_transcription:
@@ -1364,6 +1462,33 @@ class AgentActivity(RecognitionHooks):
 
             # TODO(theomonnom): should we "forward" this new turn to the next agent/activity?
             return True
+
+        # Skip turn processing if this utterance was classified as backchannel
+        # BUT only if the transcript doesn't contain explicit interrupt words
+        if self._suppress_current_utterance:
+            # Check if transcript contains interrupt words - if so, don't skip
+            should_skip = True
+            transcript = info.new_transcript or ""
+            if self._interruption_classifier is not None and transcript.strip():
+                has_interrupt, _ = self._interruption_classifier._contains_interrupt_word(transcript)
+                if has_interrupt:
+                    logger.info(
+                        f"[INTERRUPT_FILTER] Override suppression - found interrupt word | "
+                        f"transcript='{transcript}'"
+                    )
+                    should_skip = False
+            
+            # Reset flag for next utterance
+            self._suppress_current_utterance = False
+            
+            if should_skip:
+                logger.info(
+                    f"[INTERRUPT_FILTER] Skipping turn processing - backchannel utterance | "
+                    f"transcript='{transcript}'"
+                )
+                if self._rt_session is not None:
+                    self._rt_session.clear_audio()
+                return True
 
         if (
             self.stt is not None

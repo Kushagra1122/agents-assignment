@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 from livekit.agents import AgentServer, JobContext, cli
 from livekit.agents.llm import function_tool
 from livekit.agents.voice import Agent, AgentSession
-from livekit.plugins import openai
+from livekit.plugins import openai, silero, deepgram
 
 logger = logging.getLogger("weather-example")
 logger.setLevel(logging.INFO)
@@ -18,7 +18,9 @@ class WeatherAgent(Agent):
     def __init__(self) -> None:
         super().__init__(
             instructions="You are a weather agent.",
-            llm=openai.realtime.RealtimeModel(),
+            llm=openai.realtime.RealtimeModel(
+                turn_detection=None,  # Disable server-side turn detection
+            ),
         )
 
     @function_tool
@@ -65,7 +67,40 @@ async def entrypoint(ctx: JobContext):
         "user_id": "your user_id",
     }
 
-    session = AgentSession()
+    # Configure session with smart interruption filtering
+    session = AgentSession(
+        # Use local VAD for turn detection
+        vad=silero.VAD.load(),
+        turn_detection="vad",
+        # Add STT for transcript access during interruption filtering
+        stt=deepgram.STT(
+            model="nova-2",
+            interim_results=True,
+        ),
+        # Configure smart interruption filtering
+        ignore_words=[
+            "yeah", "yes", "yep", "yup", "uh-huh", "uh huh", "uhuh",
+            "okay", "ok", "k", "mm-hmm", "mmhmm", "mhm", "mm",
+            "right", "sure", "got it", "gotcha", "i see",
+            "hmm", "hm", "ah", "oh", "uh",
+        ],
+        interrupt_words=[
+            "stop", "wait", "hold on", "pause", "cancel", "quit",
+            "no", "nope", "don't", "stop talking", "be quiet",
+            "shut up", "enough", "actually",
+        ],
+        interruption_grace_period=0.3,
+    )
+
+    # Add event handlers for conversation logging
+    @session.on("user_input_transcribed")
+    def on_user_input(ev):
+        if ev.is_final:
+            logger.info(f"[USER FINAL] {ev.transcript}")
+
+    @session.on("agent_state_changed")
+    def on_state_changed(ev):
+        logger.info(f"[STATE] Agent state: {ev.state}")
 
     await session.start(
         agent=WeatherAgent(),
